@@ -1,0 +1,1 @@
+[![Scripted in 🖥️ CLI](https://a.b-b.top/badge.svg?repo=batch_files&label=Scripted%20in%20🖥️%20CLI&background_color=607d8b&background_color2=78909c&utm_source=github&utm_medium=readme&utm_campaign=badge)](https://a.b-b.top) 
