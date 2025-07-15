@@ -22,22 +22,44 @@ class SonarQubeClient:
         self.session.auth = (token, '')
 
     def get_issues_detailed(self, project_key: str, include_resolved: bool = False) -> List[Dict]:
-        """Fetch ALL issues with detailed information"""
+        """Fetch ALL issues with detailed information using pagination"""
         url = f"{self.base_url}/api/issues/search"
         params = {
             'componentKeys': project_key,
-            'ps': 500,
+            'ps': 500,  # Page size
             'facets': 'types,severities,resolutions'
         }
 
         if not include_resolved:
             params['resolved'] = 'false'
 
+        all_issues = []
+        page = 1
+        total = None
+
         try:
-            response = self.session.get(url, params=params)
-            response.raise_for_status()
-            data = response.json()
-            return data.get('issues', [])
+            while total is None or len(all_issues) < total:
+                params['p'] = page
+                response = self.session.get(url, params=params)
+                response.raise_for_status()
+                data = response.json()
+                
+                issues = data.get('issues', [])
+                all_issues.extend(issues)
+                
+                # Update total on first page
+                if total is None:
+                    total = data.get('total', 0)
+                    print(f"Found {total} issues in SonarQube")
+                
+                # Break if no more issues or empty page
+                if not issues:
+                    break
+                
+                page += 1
+                print(f"Fetched page {page-1}, got {len(issues)} issues (total: {len(all_issues)}/{total})")
+            
+            return all_issues
         except requests.exceptions.RequestException as e:
             print(f"Error fetching issues from SonarQube: {e}")
             return []
@@ -284,9 +306,11 @@ class SonarKanboardIntegration:
         print(f"\n=== Starting synchronization at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
 
         # Get organized issues from SonarQube
+        print("Fetching issues from SonarQube...")
         organized_issues = self.sonar_client.get_issues_by_type_and_resolution(self.sonar_project_key)
 
         # Get existing tasks from Kanboard
+        print("Fetching tasks from Kanboard...")
         existing_tasks = self.kanboard_client.get_all_tasks(self.project_id)
         existing_refs = {task.get('reference', ''): task for task in existing_tasks}
 
@@ -311,7 +335,15 @@ class SonarKanboardIntegration:
             type_name = self.type_mappings[issue_type]
             print(f"\nProcessing {type_name} issues ({len(issues)} total)...")
 
+            # Add progress tracking
+            processed = 0
+            total_issues = len(issues)
+            
             for issue in issues:
+                processed += 1
+                if processed % 10 == 0 or processed == total_issues:
+                    print(f"  Progress: {processed}/{total_issues} ({int(processed/total_issues*100)}%)")
+                
                 issue_key = issue.get('key', '')
                 reference = f"sonar-{issue_key}"
 
@@ -347,6 +379,7 @@ class SonarKanboardIntegration:
                         stats['errors'] += 1
 
         # Process resolved issues (move to resolved column)
+        print("\nProcessing resolved issues...")
         resolved_refs = set()
         for issue_type, issues in organized_issues['resolved'].items():
             for issue in issues:
@@ -354,13 +387,22 @@ class SonarKanboardIntegration:
                 reference = f"sonar-{issue_key}"
                 resolved_refs.add(reference)
 
-        for reference, task in existing_refs.items():
-            if reference.startswith('sonar-') and reference in resolved_refs:
-                # Move to resolved column
-                if int(task['column_id']) != resolved_column_id:
-                    if self.kanboard_client.move_task_to_column(task['id'], resolved_column_id):
-                        print(f"  ↳ ✓ Moved to resolved: {task.get('title', 'Unknown')[:50]}...")
-                        stats['resolved'] += 1
+        resolved_count = 0
+        to_resolve = [task for ref, task in existing_refs.items() 
+                     if ref.startswith('sonar-') and ref in resolved_refs 
+                     and int(task['column_id']) != resolved_column_id]
+        
+        total_to_resolve = len(to_resolve)
+        print(f"Found {total_to_resolve} tasks to mark as resolved")
+        
+        for task in to_resolve:
+            resolved_count += 1
+            if resolved_count % 10 == 0 or resolved_count == total_to_resolve:
+                print(f"  Progress: {resolved_count}/{total_to_resolve} ({int(resolved_count/total_to_resolve*100)}%)")
+            
+            if self.kanboard_client.move_task_to_column(task['id'], resolved_column_id):
+                print(f"  ↳ ✓ Moved to resolved: {task.get('title', 'Unknown')[:50]}...")
+                stats['resolved'] += 1
 
         return stats
 
@@ -387,16 +429,33 @@ class SonarKanboardIntegration:
         existing_tasks = self.kanboard_client.get_all_tasks(self.project_id)
 
         sonar_refs = set()
+        unresolved_count = 0
+        resolved_count = 0
+        issue_type_counts = {
+            'CODE_SMELL': {'unresolved': 0, 'resolved': 0},
+            'BUG': {'unresolved': 0, 'resolved': 0},
+            'VULNERABILITY': {'unresolved': 0, 'resolved': 0}
+        }
+        
         for status in ['unresolved', 'resolved']:
             for issue_type, issues in organized_issues[status].items():
                 for issue in issues:
                     sonar_refs.add(f"sonar-{issue.get('key', '')}")
+                    if status == 'unresolved':
+                        unresolved_count += 1
+                        issue_type_counts[issue_type]['unresolved'] += 1
+                    else:
+                        resolved_count += 1
+                        issue_type_counts[issue_type]['resolved'] += 1
 
         kanboard_refs = {task.get('reference', '') for task in existing_tasks if
                          task.get('reference', '').startswith('sonar-')}
 
         return {
-            'sonar_issues': len(sonar_refs),
+            'sonar_issues_total': len(sonar_refs),
+            'sonar_issues_unresolved': unresolved_count,
+            'sonar_issues_resolved': resolved_count,
+            'issue_type_counts': issue_type_counts,
             'kanboard_tasks': len(kanboard_refs),
             'synchronized': len(sonar_refs.intersection(kanboard_refs)),
             'missing_in_kanboard': len(sonar_refs - kanboard_refs),
@@ -407,11 +466,11 @@ class SonarKanboardIntegration:
 def main():
     # Configuration
     SONAR_URL = 'http://localhost:9000'
-    SONAR_TOKEN = 'sqp_28c689324c523469dc...SQTOKEN...36842064185f'
-    KANBOARD_URL = 'https://your_kanboard.url/jsonrpc.php'
-    KANBOARD_TOKEN = '....9fb2139d176098288ed...APITOKEN.....ec2dce4fc91fa9277c7f...'
-    PROJECT_ID = 9
-    SONAR_PROJECT_KEY = 'infra'
+    SONAR_TOKEN = ''
+    KANBOARD_URL = 'https://URL/jsonrpc.php'
+    KANBOARD_TOKEN = ''
+    PROJECT_ID = 1
+    SONAR_PROJECT_KEY = '----'
 
     parser = argparse.ArgumentParser(description='SonarQube-Kanboard Integration')
     parser.add_argument('--mode', choices=['sync', 'continuous', 'status'],
@@ -443,8 +502,15 @@ def main():
     if args.mode == 'status':
         status = integration.get_integration_status()
         print(f"\n=== Integration Status ===")
-        print(f"SonarQube issues: {status['sonar_issues']}")
-        print(f"Kanboard tasks: {status['kanboard_tasks']}")
+        print(f"SonarQube issues: {status['sonar_issues_total']} total")
+        print(f"  - Unresolved: {status['sonar_issues_unresolved']}")
+        print(f"  - Resolved: {status['sonar_issues_resolved']}")
+        
+        print(f"\nIssue breakdown:")
+        for issue_type, counts in status['issue_type_counts'].items():
+            print(f"  {issue_type}: {counts['unresolved']} unresolved, {counts['resolved']} resolved")
+        
+        print(f"\nKanboard tasks: {status['kanboard_tasks']}")
         print(f"Synchronized: {status['synchronized']}")
         print(f"Missing in Kanboard: {status['missing_in_kanboard']}")
         print(f"Orphaned in Kanboard: {status['orphaned_in_kanboard']}")
