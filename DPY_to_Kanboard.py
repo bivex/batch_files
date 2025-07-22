@@ -13,6 +13,7 @@ import argparse
 from datetime import datetime
 import time
 import schedule
+import concurrent.futures
 
 class KanboardClient:
     """Client for interacting with Kanboard API using JSON-RPC"""
@@ -183,34 +184,48 @@ class DPyKanboardIntegration:
         stats = {'created': 0, 'updated': 0, 'errors': 0}
         target_column_id = self.columns.get(target_column, list(self.columns.values())[0])
         print(f"Target column: {target_column} (ID: {target_column_id})")
-        processed = 0
         total_smells = len(self.smells)
-        for smell in self.smells:
-            processed += 1
-            if processed % 10 == 0 or processed == total_smells:
-                print(f"  Progress: {processed}/{total_smells} ({int(processed / total_smells * 100)}%)")
+
+        def process_smell(smell):
             reference = self.smell_to_reference(smell)
             existing_task = existing_refs.get(reference)
             task_data = self.map_smell_to_task(smell, target_column_id)
-            if existing_task:
-                if self.kanboard_client.update_task(existing_task['id'], {
-                    'title': task_data['title'],
-                    'description': task_data['description'],
-                    'color_id': task_data['color_id']
-                }):
-                    print(f"  ↳ ✓ Updated: {smell.get('Details', '')[:50]}...")
-                    stats['updated'] += 1
-                else:
-                    print(f"  ↳ ✗ Failed to update: {smell.get('Details', '')[:50]}...")
-                    stats['errors'] += 1
-            else:
-                task_id = self.kanboard_client.create_task(task_data)
-                if task_id:
-                    print(f"  ↳ ✓ Created: {smell.get('Details', '')[:50]}...")
-                    stats['created'] += 1
-                else:
-                    print(f"  ↳ ✗ Failed to create: {smell.get('Details', '')[:50]}...")
-                    stats['errors'] += 1
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    if existing_task:
+                        if self.kanboard_client.update_task(existing_task['id'], {
+                            'title': task_data['title'],
+                            'description': task_data['description'],
+                            'color_id': task_data['color_id']
+                        }):
+                            print(f"  ↳ ✓ Updated: {smell.get('Details', '')[:50]}...")
+                            return 'updated'
+                        else:
+                            print(f"  ↳ ✗ Failed to update: {smell.get('Details', '')[:50]}...")
+                            return 'errors'
+                    else:
+                        task_id = self.kanboard_client.create_task(task_data)
+                        if task_id:
+                            print(f"  ↳ ✓ Created: {smell.get('Details', '')[:50]}...")
+                            return 'created'
+                        else:
+                            print(f"  ↳ ✗ Failed to create: {smell.get('Details', '')[:50]}...")
+                            return 'errors'
+                except Exception as e:
+                    err_str = str(e)
+                    if 'database is locked' in err_str and attempt < max_retries - 1:
+                        print(f"  ↳ Retrying due to database lock (attempt {attempt+2}/{max_retries})...")
+                        time.sleep(1)
+                        continue
+                    print(f"  ↳ ✗ Exception: {e}")
+                    return 'errors'
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            results = list(executor.map(process_smell, self.smells))
+        for r in results:
+            if r in stats:
+                stats[r] += 1
         return stats
 
     def get_integration_status(self) -> Dict:
