@@ -1,0 +1,39 @@
+Windows Registry Editor Version 5.00
+
+; ==================================================
+; Enhanced Font Rendering Configuration
+; ==================================================
+
+; Enable ClearType with optimized settings
+[HKEY_CURRENT_USER\Control Panel\Desktop]
+"FontSmoothing"="2"
+"FontSmoothingType"=dword:00000002
+"FontSmoothingGamma"=dword:000003e8
+"FontSmoothingOrientation"=dword:00000001
+"FontSmoothingContrast"=dword:00000578
+
+; Set consistent DPI awareness
+[HKEY_CURRENT_USER\Control Panel\Desktop]
+"LogPixels"=dword:00000096
+"Win8DpiScaling"=dword:00000001
+"EnablePerProcessSystemDPI"=dword:00000001
+
+; Enhanced DirectWrite rendering for modern applications
+[HKEY_CURRENT_USER\Software\Microsoft\Avalon.Graphics]
+"Display1_TextContrastLevel"=dword:00000006
+"Display1_TextGamma"=dword:000008fc
+"Display1_EnhancedContrastLevel"=dword:00000032
+"Display1_ClearTypeLevel"=dword:00000064
+"Display1_PixelStructure"=dword:00000001
+
+; Additional system-wide font improvements
+[HKEY_CURRENT_USER\Control Panel\Desktop\WindowMetrics]
+"AppliedDPI"=dword:00000060
+
+; Force DirectWrite for legacy applications
+[HKEY_CURRENT_USER\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers]
+"C:\\Windows\\System32\\*.exe"="HIGHDPIAWARE"
+
+; Disable font smoothing cache for immediate changes
+[HKEY_CURRENT_USER\Control Panel\Desktop]
+"FontSmoothingCache"=dword:00000000
