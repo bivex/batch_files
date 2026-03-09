@@ -25,6 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kind", default="Function", help="Understand kind filter for lookup")
     parser.add_argument("--db", default=str(DEFAULT_DB), help="Path to .und database")
     parser.add_argument("--limit", type=int, default=10, help="Rows per section")
+    parser.add_argument("--verbose", action="store_true", help="Show raw refs and local details too")
     return parser.parse_args()
 
 
@@ -67,13 +68,14 @@ def resolve_entity(db, name: str, kind: str):
 def collect_refs(ent, refkinds: str):
     rows = []
     for ref in ent.refs(refkinds):
-        rows.append((ref.kindname(), label(ref.ent()), ref.line(), ref.column()))
+        rows.append((ref.kindname(), label(ref.ent()), ref.line(), ref.column(), ref))
     rows.sort(key=lambda row: (row[2], row[3], row[1]))
     seen = set()
     unique = []
     for row in rows:
-        if row not in seen:
-            seen.add(row)
+        key = row[:4]
+        if key not in seen:
+            seen.add(key)
             unique.append(row)
     return unique
 
@@ -83,8 +85,127 @@ def print_section(title: str, rows, limit: int) -> None:
     if not rows:
         print("-")
         return
-    for kind, ent_name, line, column in rows[:limit]:
+    for kind, ent_name, line, column, _ref in rows[:limit]:
         print(f"- L{line}:C{column} | {kind:<6} | {ent_name}")
+
+
+def line_text(file_path: Path, line_no: int) -> str:
+    try:
+        return file_path.read_text(encoding="utf-8").splitlines()[line_no - 1].strip()
+    except Exception:
+        return ""
+
+
+def local_names(ent) -> set[str]:
+    try:
+        return {label(local) for local in ent.ents("Define")}
+    except Exception:
+        return set()
+
+
+def class_name(entity_name: str) -> str:
+    return entity_name.rsplit(".", 1)[0] if "." in entity_name else entity_name
+
+
+def is_local_ref(ent_name: str, entity_name: str, locals_set: set[str]) -> bool:
+    return ent_name == entity_name or ent_name in locals_set or ent_name.startswith(entity_name + ".")
+
+
+def is_self_noise(ent_name: str) -> bool:
+    return ent_name.endswith(".self") or ent_name == "self"
+
+
+def builtin_noise(ent_name: str) -> bool:
+    return ent_name.startswith("builtins.")
+
+
+def getter_noise(call_name: str) -> bool:
+    short = call_name.rsplit(".", 1)[-1]
+    return short in {"text", "toPlainText", "currentText", "currentData", "value", "isChecked"}
+
+
+def receiver_hints(line_refs, entity_name: str, locals_set: set[str]) -> list[str]:
+    hints = []
+    for kind, ent_name, _line, _column, _ref in line_refs:
+        if kind != "Use":
+            continue
+        if is_local_ref(ent_name, entity_name, locals_set) or is_self_noise(ent_name):
+            continue
+        if ent_name not in hints:
+            hints.append(ent_name)
+    return hints
+
+
+def external_views(ent):
+    entity_name = label(ent)
+    class_label = class_name(entity_name)
+    locals_set = local_names(ent)
+    rows = collect_refs(ent, "Use,Set,Call")
+    by_line = {}
+    for row in rows:
+        by_line.setdefault(row[2], []).append(row)
+
+    inputs = []
+    outputs = []
+    for line, line_rows in sorted(by_line.items()):
+        text = line_text(Path(line_rows[0][4].file().longname()), line)
+        uses = [r for r in line_rows if r[0] == "Use"]
+        calls = [r for r in line_rows if r[0] == "Call"]
+        sets = [r for r in line_rows if r[0] == "Set"]
+        has_sink_call = any(not getter_noise(ent_name) for _kind, ent_name, *_rest in calls)
+        has_getter_call = any(getter_noise(ent_name) for _kind, ent_name, *_rest in calls)
+
+        for kind, ent_name, _ln, col, _ref in uses:
+            if is_local_ref(ent_name, entity_name, locals_set) or is_self_noise(ent_name) or builtin_noise(ent_name):
+                continue
+            if has_sink_call and not has_getter_call:
+                continue
+            if ent_name.startswith(class_label + ".") and ent_name == class_label:
+                continue
+            if any(call_name.startswith(ent_name + ".") for _k, call_name, *_ in calls):
+                continue
+            inputs.append((kind, ent_name, line, col, text))
+
+        hints = receiver_hints(line_rows, entity_name, locals_set)
+        for kind, ent_name, _ln, col, _ref in calls:
+            if getter_noise(ent_name):
+                continue
+            if ent_name.startswith(class_label + "."):
+                continue
+            display = ent_name
+            if hints:
+                display = f"{display} via {', '.join(hints[:2])}"
+            outputs.append((kind, display, line, col, text))
+
+        for kind, ent_name, _ln, col, _ref in sets:
+            if is_local_ref(ent_name, entity_name, locals_set) or is_self_noise(ent_name):
+                continue
+            outputs.append((kind, ent_name, line, col, text))
+
+    deduped_inputs, seen_inputs = [], set()
+    for row in inputs:
+        key = row[:4]
+        if key not in seen_inputs:
+            seen_inputs.add(key)
+            deduped_inputs.append(row)
+
+    deduped_outputs, seen_outputs = [], set()
+    for row in outputs:
+        key = row[:4]
+        if key not in seen_outputs:
+            seen_outputs.add(key)
+            deduped_outputs.append(row)
+    return deduped_inputs, deduped_outputs
+
+
+def print_external_section(title: str, rows, limit: int) -> None:
+    print(f"\n## {title} ({len(rows)})")
+    if not rows:
+        print("-")
+        return
+    for kind, ent_name, line, column, text in rows[:limit]:
+        suffix = f" | {text}" if text else ""
+        print(f"- L{line}:C{column} | {kind:<6} | {ent_name}{suffix}")
 
 
 def print_local_flows(ent, limit: int) -> None:
@@ -135,11 +256,15 @@ def main() -> int:
         print(f"Entity: {label(ent)}")
         print(f"Kind: {ent.kindname()}")
 
-        print_section("Inputs (Use)", collect_refs(ent, "Use"), args.limit)
-        print_section("Writes (Set)", collect_refs(ent, "Set"), args.limit)
-        print_section("Calls (Call)", collect_refs(ent, "Call"), args.limit)
-        print_section("Definitions (Define)", collect_refs(ent, "Define"), args.limit)
-        print_local_flows(ent, args.limit)
+        inputs, outputs = external_views(ent)
+        print_external_section("External inputs", inputs, args.limit)
+        print_external_section("External outputs / sinks", outputs, args.limit)
+        if args.verbose:
+            print_section("Inputs (Use)", collect_refs(ent, "Use"), args.limit)
+            print_section("Writes (Set)", collect_refs(ent, "Set"), args.limit)
+            print_section("Calls (Call)", collect_refs(ent, "Call"), args.limit)
+            print_section("Definitions (Define)", collect_refs(ent, "Define"), args.limit)
+            print_local_flows(ent, args.limit)
         print_cfg(ent)
         return 0
     finally:
