@@ -1,6 +1,23 @@
 #!/Applications/Understand.app/Contents/MacOS/upython
 """Automatic architecture plugin + standalone preview for loreSystem.
 
+Hexagonal / DDD rules used by this plugin:
+  - presentation is an outer adapter layer.
+  - application orchestrates use cases and may depend on domain.
+  - domain is the core and should not depend on application, presentation,
+    or infrastructure.
+  - infrastructure is an outer adapter layer and may depend on domain.
+  - preferred dependency direction:
+      presentation -> application -> domain
+      infrastructure -> domain
+  - likely violations reported by `--violations-only`:
+      presentation -> domain
+      presentation -> infrastructure
+      application -> infrastructure
+      application -> presentation
+      domain -> application|presentation|infrastructure
+      infrastructure -> application|presentation
+
 Plugin entrypoints:
   - name()
   - description()
@@ -10,6 +27,8 @@ Standalone examples:
   ./scripts/understand_layer_arch_plugin.py
   ./scripts/understand_layer_arch_plugin.py --coarse --exclude-init --exclude-examples
   ./scripts/understand_layer_arch_plugin.py --coarse --exclude-init --report-edges
+  ./scripts/understand_layer_arch_plugin.py --coarse --exclude-init --report-edges --cross-layer-only
+  ./scripts/understand_layer_arch_plugin.py --coarse --exclude-init --violations-only
 """
 
 from __future__ import annotations
@@ -86,6 +105,26 @@ def classify_file(file_ent, coarse: bool = False, exclude_init: bool = False, ex
     return "/".join(group + [module])
 
 
+def top_layer(path: str) -> str:
+    return path.split("/", 1)[0]
+
+
+def is_violation_edge(src_group: str, dep_group: str) -> bool:
+    src = top_layer(src_group)
+    dep = top_layer(dep_group)
+    if src == dep:
+        return False
+    if src == "domain":
+        return dep in {"application", "presentation", "infrastructure"}
+    if src == "application":
+        return dep in {"presentation", "infrastructure"}
+    if src == "presentation":
+        return dep in {"domain", "infrastructure"}
+    if src == "infrastructure":
+        return dep in {"application", "presentation"}
+    return False
+
+
 def iter_source_files(db):
     for file_ent in db.files():
         rel = _rel_src_path(file_ent)
@@ -115,6 +154,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--exclude-init", action="store_true", help="Exclude __init__.py files from preview")
     parser.add_argument("--exclude-examples", action="store_true", help="Exclude src/application/examples from preview")
     parser.add_argument("--report-edges", action="store_true", help="Show aggregated dependency edges between architecture groups")
+    parser.add_argument("--cross-layer-only", action="store_true", help="With --report-edges, keep only edges that cross top-level layers")
+    parser.add_argument("--violations-only", action="store_true", help="Show only likely DDD boundary violations; implies --report-edges and --cross-layer-only")
     return parser.parse_args()
 
 
@@ -126,6 +167,8 @@ def preview(
     exclude_init: bool,
     exclude_examples: bool,
     report_edges: bool,
+    cross_layer_only: bool,
+    violations_only: bool,
 ) -> int:
     db = understand.open(str(db_path))
     try:
@@ -164,7 +207,7 @@ def preview(
         for node, count in by_group.most_common(limit):
             print(f"- {node}: {count}")
 
-        if report_edges:
+        if report_edges or violations_only:
             edge_counts = Counter()
             for file_ent in iter_source_files(db):
                 src_target = ent_to_target.get(file_ent.longname())
@@ -177,13 +220,17 @@ def preview(
                     if not dep_target:
                         continue
                     dep_group = dep_target if coarse else ("/".join(dep_target.split("/")[:-1]) or dep_target)
+                    if (cross_layer_only or violations_only) and top_layer(src_group) == top_layer(dep_group):
+                        continue
+                    if violations_only and not is_violation_edge(src_group, dep_group):
+                        continue
                     edge = (src_group, dep_group)
                     if edge in seen:
                         continue
                     seen.add(edge)
                     edge_counts[edge] += 1
 
-            print("\n## Architecture edges")
+            print("\n## DDD boundary violations" if violations_only else "\n## Architecture edges")
             for (src_group, dep_group), count in edge_counts.most_common(limit):
                 print(f"- {src_group} -> {dep_group}: {count}")
 
@@ -213,5 +260,7 @@ if __name__ == "__main__":
             args.exclude_init,
             args.exclude_examples,
             args.report_edges,
+            args.cross_layer_only,
+            args.violations_only,
         )
     )
