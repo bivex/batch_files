@@ -31,6 +31,8 @@ Standalone examples:
   ./scripts/understand_layer_arch_plugin.py --coarse --exclude-init --violations-only
   ./scripts/understand_layer_arch_plugin.py --coarse --exclude-init --violations-only --fail-on-violation
   ./scripts/understand_layer_arch_plugin.py --coarse --exclude-init --report-edges --show-paths --json
+  ./scripts/understand_layer_arch_plugin.py --coarse --exclude-init --violations-only --summary-only
+  ./scripts/understand_layer_arch_plugin.py --policy-init /tmp/layer_policy.json
 """
 
 from __future__ import annotations
@@ -199,6 +201,42 @@ def save_baseline(path: str, items: list[dict]) -> None:
     Path(path).expanduser().write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def default_policy_template() -> dict:
+    return {
+        "version": 1,
+        "description": "Policy template for loreSystem layer architecture checks.",
+        "allow_edges": [
+            {
+                "src": "presentation/gui",
+                "dst": "application/use_cases",
+                "reason": "Preferred UI -> use case flow",
+            }
+        ],
+        "deny_edges": [
+            {
+                "src": "presentation/gui",
+                "dst": "domain/entities",
+                "reason": "Direct UI -> domain entity coupling should be reduced",
+            },
+            {
+                "src": "presentation/gui",
+                "dst": "domain/value_objects",
+                "reason": "Direct UI -> domain value object coupling should be reduced",
+            }
+        ],
+        "notes": [
+            "Patterns support shell-style globs via fnmatch.",
+            "deny_edges override allow_edges when both match.",
+            "Use compare-baseline to fail CI only on newly introduced violations.",
+        ],
+    }
+
+
+def init_policy_file(path: str) -> None:
+    target = Path(path).expanduser()
+    target.write_text(json.dumps(default_policy_template(), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
 def is_violation_edge(src_group: str, dep_group: str) -> bool:
     src = top_layer(src_group)
     dep = top_layer(dep_group)
@@ -300,8 +338,11 @@ def build_edge_items(
     return items
 
 
-def render_text(report: dict) -> str:
+def render_text(report: dict, summary_only: bool = False) -> str:
     lines = [f"DB: {report['db']}", f"Mapped source files: {report['mapped_source_files']}"]
+    lines.append(f"Violation count: {report['violation_count']}")
+    if report.get("edge_count") is not None:
+        lines.append(f"Edge count: {report['edge_count']}")
 
     lines.append("\n## Top layer buckets")
     for item in report["top_layer_buckets"]:
@@ -320,13 +361,13 @@ def render_text(report: dict) -> str:
     else:
         items = None
 
-    if items is not None:
+    if items is not None and not summary_only:
         for item in items:
             lines.append(f"- {item['src']} -> {item['dst']}: {item['count']}")
             for example in item.get("examples", []):
                 lines.append(f"  - {example['src_file']} -> {example['dep_file']}")
 
-    if report["sample_mappings"] is not None:
+    if report["sample_mappings"] is not None and not summary_only:
         lines.append("\n## Sample mappings")
         for node in sorted(report["sample_mappings"]):
             lines.append(f"- {node}")
@@ -342,8 +383,10 @@ def render_text(report: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-def render_markdown(report: dict) -> str:
-    lines = [f"## DB\n- `{report['db']}`", f"\n## Mapped source files\n- {report['mapped_source_files']}"]
+def render_markdown(report: dict, summary_only: bool = False) -> str:
+    lines = [f"## DB\n- `{report['db']}`", f"\n## Mapped source files\n- {report['mapped_source_files']}", f"\n## Counts\n- violations: {report['violation_count']}"]
+    if report.get("edge_count") is not None:
+        lines.append(f"- edges: {report['edge_count']}")
     lines.append("\n## Top layer buckets")
     for item in report["top_layer_buckets"]:
         lines.append(f"- `{item['name']}`: {item['count']}")
@@ -358,10 +401,11 @@ def render_markdown(report: dict) -> str:
         items = report["sections"]["edges"]
     else:
         items = []
-    for item in items:
-        lines.append(f"- `{item['src']}` -> `{item['dst']}`: {item['count']}")
-        for example in item.get("examples", []):
-            lines.append(f"  - `{example['src_file']}` -> `{example['dep_file']}`")
+    if not summary_only:
+        for item in items:
+            lines.append(f"- `{item['src']}` -> `{item['dst']}`: {item['count']}")
+            for example in item.get("examples", []):
+                lines.append(f"  - `{example['src_file']}` -> `{example['dep_file']}`")
     if report.get("baseline"):
         lines.append("\n## Baseline comparison")
         lines.append(f"- new: {report['baseline']['new_count']}")
@@ -370,27 +414,32 @@ def render_markdown(report: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-def render_csv(report: dict) -> str:
+def render_csv(report: dict, summary_only: bool = False) -> str:
     output = StringIO()
     writer = csv.DictWriter(output, fieldnames=["row_type", "name", "count", "src", "dst", "examples"])
     writer.writeheader()
+    writer.writerow({"row_type": "summary", "name": "mapped_source_files", "count": report["mapped_source_files"]})
+    writer.writerow({"row_type": "summary", "name": "violation_count", "count": report["violation_count"]})
+    if report.get("edge_count") is not None:
+        writer.writerow({"row_type": "summary", "name": "edge_count", "count": report["edge_count"]})
     for item in report["top_layer_buckets"]:
         writer.writerow({"row_type": "top_layer_bucket", "name": item["name"], "count": item["count"]})
     for item in report["top_architecture_groups"]:
         writer.writerow({"row_type": "top_architecture_group", "name": item["name"], "count": item["count"]})
-    for section_name in ["edges", "violations"]:
-        items = report["sections"].get(section_name)
-        if not items:
-            continue
-        for item in items:
-            examples = " | ".join(f"{ex['src_file']} -> {ex['dep_file']}" for ex in item.get("examples", []))
-            writer.writerow({
-                "row_type": section_name[:-1],
-                "count": item["count"],
-                "src": item["src"],
-                "dst": item["dst"],
-                "examples": examples,
-            })
+    if not summary_only:
+        for section_name in ["edges", "violations"]:
+            items = report["sections"].get(section_name)
+            if not items:
+                continue
+            for item in items:
+                examples = " | ".join(f"{ex['src_file']} -> {ex['dep_file']}" for ex in item.get("examples", []))
+                writer.writerow({
+                    "row_type": section_name[:-1],
+                    "count": item["count"],
+                    "src": item["src"],
+                    "dst": item["dst"],
+                    "examples": examples,
+                })
     if report.get("baseline"):
         writer.writerow({"row_type": "baseline_new", "count": report["baseline"]["new_count"]})
         writer.writerow({"row_type": "baseline_resolved", "count": report["baseline"]["resolved_count"]})
@@ -417,10 +466,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--show-paths", action="store_true", help="Include example file-to-file paths for reported edges")
     parser.add_argument("--max-examples", type=int, default=3, help="Maximum example paths per edge (default: 3)")
     parser.add_argument("--policy-file", help="Path to JSON policy file with allow_edges/deny_edges")
+    parser.add_argument("--policy-init", help="Write a starter policy JSON file and exit")
     parser.add_argument("--baseline", help="Write current filtered violation signatures to this baseline JSON file")
     parser.add_argument("--compare-baseline", help="Compare filtered violations against a saved baseline JSON file")
     parser.add_argument("--include", action="append", default=[], help="Repo-relative glob to include; can be repeated")
     parser.add_argument("--exclude", action="append", default=[], help="Repo-relative glob to exclude; can be repeated")
+    parser.add_argument("--summary-only", action="store_true", help="Show only summary counts and top buckets/groups")
     return parser.parse_args()
 
 
@@ -446,6 +497,7 @@ def preview(
     compare_baseline_path: str | None,
     includes: list[str],
     excludes: list[str],
+    summary_only: bool,
 ) -> int:
     db = understand.open(str(db_path))
     try:
@@ -545,6 +597,7 @@ def preview(
                 "edges": edges[:limit] if edges is not None and not violations_only else None,
                 "violations": violations[:limit] if violations_only else None,
             },
+            "edge_count": len(edges) if edges is not None else None,
             "violation_count": len(violations),
             "sample_mappings": sample_mappings,
             "policy": {
@@ -577,13 +630,19 @@ def preview(
 
         effective_format = "json" if json_mode else output_format
         if effective_format == "json":
-            payload = json.dumps(report, indent=2, ensure_ascii=False)
+            if summary_only:
+                summary_report = dict(report)
+                summary_report["sections"] = {"edges": None, "violations": None}
+                summary_report["sample_mappings"] = None
+                payload = json.dumps(summary_report, indent=2, ensure_ascii=False)
+            else:
+                payload = json.dumps(report, indent=2, ensure_ascii=False)
         elif effective_format == "markdown":
-            payload = render_markdown(report)
+            payload = render_markdown(report, summary_only=summary_only)
         elif effective_format == "csv":
-            payload = render_csv(report)
+            payload = render_csv(report, summary_only=summary_only)
         else:
-            payload = render_text(report)
+            payload = render_text(report, summary_only=summary_only)
         if output:
             Path(output).expanduser().write_text(payload, encoding="utf-8")
         print(payload, end="")
@@ -595,6 +654,9 @@ def preview(
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.policy_init:
+        init_policy_file(args.policy_init)
+        raise SystemExit(0)
     raise SystemExit(
         preview(
             Path(args.db).expanduser().resolve(),
@@ -618,5 +680,6 @@ if __name__ == "__main__":
             args.compare_baseline,
             args.include,
             args.exclude,
+            args.summary_only,
         )
     )
