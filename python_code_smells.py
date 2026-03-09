@@ -23,6 +23,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB = REPO_ROOT / "loreSystem.und"
 SEVERITY_ORDER = {"info": 0, "warning": 1, "error": 2}
 SKIP_KIND_TOKENS = ("Unknown", "Unresolved", "Unnamed", "Ambiguous", "Pseudo")
+DEFAULT_EXCLUDE_PATTERNS = (
+    "tests/**",
+    "src/application/examples/**",
+    "examples/**",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,6 +35,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--db", default=str(DEFAULT_DB), help="Path to .und database")
     parser.add_argument("--include", action="append", default=[], help="Only include matching repo paths (fnmatch)")
     parser.add_argument("--exclude", action="append", default=[], help="Exclude matching repo paths (fnmatch)")
+    parser.add_argument(
+        "--include-examples",
+        action="store_true",
+        help="Include example/demo/test paths in the default scan",
+    )
     parser.add_argument("--format", choices=["text", "json", "markdown"], default="text")
     parser.add_argument("--output", help="Write report to a file instead of stdout")
     parser.add_argument("--limit", type=int, default=50, help="Max findings to display (0 = all)")
@@ -45,6 +55,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-fanout", type=int, default=20)
     parser.add_argument("--max-paths", type=int, default=200)
     parser.add_argument("--max-essential", type=int, default=4)
+    parser.add_argument(
+        "--report-constructor-params",
+        action="store_true",
+        help="Include too-many-params findings for __init__ methods",
+    )
+    parser.add_argument(
+        "--report-factory-params",
+        action="store_true",
+        help="Include too-many-params findings for create() factories",
+    )
     return parser.parse_args()
 
 
@@ -76,9 +96,25 @@ def path_selected(path: str, includes: list[str], excludes: list[str]) -> bool:
     return True
 
 
+def effective_excludes(args: argparse.Namespace) -> list[str]:
+    excludes = list(args.exclude)
+    if not args.include_examples:
+        excludes = list(DEFAULT_EXCLUDE_PATTERNS) + excludes
+    return excludes
+
+
 def entity_label(ent) -> str:
     longname = safe_text(getattr(ent, "longname", lambda: "")())
     return longname or safe_text(getattr(ent, "name", lambda: "")())
+
+
+def entity_simple_name(ent) -> str:
+    getter = getattr(ent, "simplename", None)
+    if callable(getter):
+        value = safe_text(getter())
+        if value:
+            return value
+    return safe_text(getattr(ent, "name", lambda: "")())
 
 
 def kind_allowed(ent, target: str) -> bool:
@@ -182,6 +218,7 @@ def analyze_class(ent, path: str, line: int, args: argparse.Namespace) -> list[d
 
 def analyze_callable(ent, path: str, line: int, args: argparse.Namespace) -> list[dict]:
     findings = []
+    simple_name = entity_simple_name(ent)
     checks = [
         (
             "long-function", "CountLine", metric_value(ent, "CountLine"), args.max_function_lines,
@@ -213,6 +250,11 @@ def analyze_callable(ent, path: str, line: int, args: argparse.Namespace) -> lis
         ),
     ]
     for rule, metric, value, threshold, msg in checks:
+        if rule == "too-many-params":
+            if simple_name == "__init__" and not args.report_constructor_params:
+                continue
+            if simple_name == "create" and not args.report_factory_params:
+                continue
         finding = make_finding(rule, ent, path, line, metric, value, threshold, msg(value, threshold))
         if finding:
             findings.append(finding)
@@ -243,13 +285,14 @@ def iter_entities(db, includes: list[str], excludes: list[str], target: str):
 def collect_findings(db, args: argparse.Namespace) -> tuple[list[dict], dict]:
     findings = []
     scanned = {"files": 0, "classes": 0, "callables": 0}
-    for file_ent, path in iter_python_files(db, args.include, args.exclude):
+    excludes = effective_excludes(args)
+    for file_ent, path in iter_python_files(db, args.include, excludes):
         scanned["files"] += 1
         findings.extend(analyze_file(file_ent, path, args))
-    for ent, path, line in iter_entities(db, args.include, args.exclude, "class"):
+    for ent, path, line in iter_entities(db, args.include, excludes, "class"):
         scanned["classes"] += 1
         findings.extend(analyze_class(ent, path, line, args))
-    for ent, path, line in iter_entities(db, args.include, args.exclude, "callable"):
+    for ent, path, line in iter_entities(db, args.include, excludes, "callable"):
         scanned["callables"] += 1
         findings.extend(analyze_callable(ent, path, line, args))
     findings.sort(key=lambda item: (-SEVERITY_ORDER[item["severity"]], item["path"], item["line"], item["rule"], -item["value"]))
@@ -280,6 +323,8 @@ def render_text(db_name: str, scanned: dict, findings: list[dict], summary: dict
         f"Scanned classes: {scanned['classes']}",
         f"Scanned callables: {scanned['callables']}",
         f"Finding count: {len(findings)}",
+        f"Default excludes active: {'yes' if scanned.get('default_excludes_active') else 'no'}",
+        f"Param-rule skips: {scanned.get('param_rule_skips', 'none')}",
         "",
         "## Findings by severity",
     ]
@@ -310,6 +355,8 @@ def render_markdown(db_name: str, scanned: dict, findings: list[dict], summary: 
         f"- Classes: **{scanned['classes']}**",
         f"- Callables: **{scanned['callables']}**",
         f"- Findings: **{len(findings)}**",
+        f"- Default excludes active: **{'yes' if scanned.get('default_excludes_active') else 'no'}**",
+        f"- Param-rule skips: **{scanned.get('param_rule_skips', 'none')}**",
         "",
         "## Summary",
     ]
@@ -329,6 +376,13 @@ def render_json(db_name: str, scanned: dict, findings: list[dict], summary: dict
     payload = {
         "db": db_name,
         "scanned": scanned,
+        "filters": {
+            "include": args.include,
+            "exclude": args.exclude,
+            "default_excludes": [] if args.include_examples else list(DEFAULT_EXCLUDE_PATTERNS),
+            "report_constructor_params": args.report_constructor_params,
+            "report_factory_params": args.report_factory_params,
+        },
         "finding_count": len(findings),
         "summary": summary,
         "thresholds": {
@@ -370,6 +424,13 @@ def main() -> int:
     db = open_db(Path(args.db).expanduser().resolve())
     try:
         findings, scanned = collect_findings(db, args)
+        scanned["default_excludes_active"] = not args.include_examples
+        skipped_rules = []
+        if not args.report_constructor_params:
+            skipped_rules.append("__init__")
+        if not args.report_factory_params:
+            skipped_rules.append("create")
+        scanned["param_rule_skips"] = ", ".join(skipped_rules) if skipped_rules else "none"
         report = render_report(db.name(), scanned, findings, args)
         if args.output:
             Path(args.output).expanduser().write_text(report, encoding="utf-8")
