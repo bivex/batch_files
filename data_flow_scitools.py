@@ -5,6 +5,29 @@ Examples:
   ./scripts/understand_data_flow.py src.presentation.gui.tabs.worlds_tab.WorldsTab._add_world
   ./scripts/understand_data_flow.py src.presentation.gui.main_window.MainWindow._perform_save
   ./scripts/understand_data_flow.py src.presentation.gui.tabs.worlds_tab.WorldsTab._add_world --kind Function --limit 12
+
+
+Entity: src.presentation.gui.tabs.worlds_tab.WorldsTab._add_world
+Kind: Function
+
+## External inputs (4)
+- L120:C32 | Use    | src.presentation.gui.tabs.worlds_tab.WorldsTab.lore_data | tenant_id=self.lore_data.tenant_id,
+- L120:C42 | Use    | tenant_id | tenant_id=self.lore_data.tenant_id,
+- L121:C37 | Use    | src.presentation.gui.tabs.worlds_tab.WorldsTab.name_input | name=WorldName(self.name_input.text()),
+- L122:C46 | Use    | src.presentation.gui.tabs.worlds_tab.WorldsTab.description_input | description=Description(self.description_input.toPlainText())
+
+## External outputs / sinks (6)
+- L119:C27 | Call   | src.domain.entities.world.World.create via src.domain.entities.world.World | world = World.create(
+- L121:C22 | Call   | src.domain.value_objects.common.WorldName via src.presentation.gui.tabs.worlds_tab.WorldsTab.name_input | name=WorldName(self.name_input.text()),
+- L122:C29 | Call   | src.domain.value_objects.common.Description via src.presentation.gui.tabs.worlds_tab.WorldsTab.description_input | description=Description(self.description_input.toPlainText())
+- L124:C28 | Call   | add_world via src.presentation.gui.tabs.worlds_tab.WorldsTab.lore_data | self.lore_data.add_world(world)
+- L127:C25 | Call   | QMessageBox.information via QMessageBox | QMessageBox.information(self, "Success", "World created successfully!")
+- L129:C25 | Call   | QMessageBox.critical via QMessageBox | QMessageBox.critical(self, "Error", f"Failed to create world: {e}")
+
+## Control flow
+- trivial: False
+- nodes: 12
+- span: L117..L129
 """
 
 from __future__ import annotations
